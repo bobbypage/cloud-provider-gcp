@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"path"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -144,6 +145,7 @@ func (a *nodeApprover) handle(csr *capi.CertificateSigningRequest) error {
 		}
 		klog.Infof("validator %q: matched CSR %q", r.name, csr.Name)
 		if r.validate != nil {
+			klog.Infof("porterdavid gonna call validate")
 			ok, err := r.validate(a.ctx, csr, x509cr)
 			if err != nil {
 				return fmt.Errorf("validating CSR %q: %v", csr.Name, err)
@@ -154,7 +156,7 @@ func (a *nodeApprover) handle(csr *capi.CertificateSigningRequest) error {
 				return a.updateCSR(csr, false, r.denyMsg)
 			}
 		}
-		klog.Infof("CSR %q validation passed", csr.Name)
+		klog.Infof("CSR %q validation passed porterdavid was here!", csr.Name)
 
 		approved, err := a.authorizeSAR(csr, r.permission)
 		if err != nil {
@@ -701,13 +703,20 @@ func isNotFound(err error) bool {
 }
 
 func ensureNodeMatchesMetadataOrDelete(ctx *controllerContext, csr *capi.CertificateSigningRequest, x509cr *x509.CertificateRequest) error {
+	klog.Infof("porterdavid enter ensureNodeMatchesMetadataOrDelete")
 	// TODO: short-circuit
 	if !strings.HasPrefix(x509cr.Subject.CommonName, "system:node:") {
+		klog.Infof("porterdavid exit 1 ensureNodeMatchesMetadataOrDelete %v", x509cr.Subject.CommonName)
 		return nil
 	}
 	nodeName := strings.TrimPrefix(x509cr.Subject.CommonName, "system:node:")
 	if len(nodeName) == 0 {
+		klog.Infof("porterdavid exit 2 ensureNodeMatchesMetadataOrDelete %v", x509cr.Subject.CommonName)
 		return nil
+	}
+
+	if err := deleteAllPodsBoundToNode(ctx, nodeName); err != nil {
+		klog.Infof("porterdavid failed to delete all pods bound to node %v", nodeName)
 	}
 
 	recordMetric := csrmetrics.OutboundRPCStartRecorder("k8s.Nodes.get")
@@ -715,6 +724,7 @@ func ensureNodeMatchesMetadataOrDelete(ctx *controllerContext, csr *capi.Certifi
 	if apierrors.IsNotFound(err) {
 		recordMetric(csrmetrics.OutboundRPCStatusNotFound)
 		// if there is no existing Node object, return success
+		klog.Infof("porterdavid node object is nil, returning from ensureNodeMatchesMetadataOrDelete nodeName: %v", nodeName)
 		return nil
 	}
 	if err != nil {
@@ -726,6 +736,7 @@ func ensureNodeMatchesMetadataOrDelete(ctx *controllerContext, csr *capi.Certifi
 	recordMetric(csrmetrics.OutboundRPCStatusOK)
 
 	delete, err := shouldDeleteNode(ctx, node, getInstanceByName)
+
 	if err != nil {
 		// returning an error triggers a retry of this CSR.
 		// if the errors are persistent, the CSR will not be approved and the node bootstrap will hang.
@@ -756,11 +767,8 @@ func ensureNodeMatchesMetadataOrDelete(ctx *controllerContext, csr *capi.Certifi
 var errInstanceNotFound = errors.New("instance not found")
 
 func shouldDeleteNode(ctx *controllerContext, node *v1.Node, getInstance func(*controllerContext, string) (*compute.Instance, error)) (bool, error) {
-	// Newly created node might not have pod CIDR allocated yet.
-	if node.Spec.PodCIDR == "" {
-		klog.V(2).Infof("Node %q has empty podCIDR.", node.Name)
-		return false, nil
-	}
+	klog.Infof("porterdavid enter should delete node", node.Name)
+
 	inst, err := getInstance(ctx, node.Name)
 	if err != nil {
 		if err == errInstanceNotFound {
@@ -769,6 +777,21 @@ func shouldDeleteNode(ctx *controllerContext, node *v1.Node, getInstance func(*c
 		}
 		klog.Errorf("Error retrieving instance %q: %v", node.Name, err)
 		return false, err
+	}
+
+	oldInstanceId := node.ObjectMeta.Annotations[InstanceIDAnnotationKey]
+	newInstanceId := strconv.FormatUint(inst.Id, 10)
+
+	klog.Infof("porterdavid Instance %q has old instance id %q new instance id %q", inst.Name, oldInstanceId, newInstanceId)
+	if oldInstanceId != "" && newInstanceId != "" && oldInstanceId != newInstanceId {
+		klog.Infof("porterdavid Instance %q has old instance id %q new instance id %q returning true!", inst.Name, oldInstanceId, newInstanceId)
+		return true, nil
+	}
+
+	// Newly created node might not have pod CIDR allocated yet.
+	if node.Spec.PodCIDR == "" {
+		klog.V(2).Infof("Node %q has empty podCIDR.", node.Name)
+		return false, nil
 	}
 	var unmatchedRanges []string
 	for _, networkInterface := range inst.NetworkInterfaces {
@@ -786,7 +809,29 @@ func shouldDeleteNode(ctx *controllerContext, node *v1.Node, getInstance func(*c
 	}
 	// Instance with no alias range is route based, for which node object deletion is unnecessary.
 	klog.V(2).Infof("Instance %q has no alias range.", inst.Name)
+
 	return false, nil
+}
+
+func deleteAllPodsBoundToNode(ctx *controllerContext, nodeName string) error {
+	klog.V(1).Infof("porterdavid start delete all pods pod on node %v", nodeName)
+
+	podList, err := ctx.client.CoreV1().Pods(metav1.NamespaceAll).List(context.TODO(), metav1.ListOptions{FieldSelector: "spec.nodeName=" + nodeName})
+	if err != nil {
+		klog.Infof("porterdavid delete pods on node %v failed %v", nodeName, err)
+	}
+
+	for _, pod := range podList.Items {
+		klog.Infof("porterdavid start delete pod %v %v on node %v", pod.Namespace, pod.Name, nodeName)
+		err := ctx.client.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, *metav1.NewDeleteOptions(0))
+		if err != nil {
+			klog.Infof("porterdavid delete pod %v %v on node %v failed :%v", pod.Namespace, pod.Name, nodeName, err)
+		}
+		klog.Infof("porterdavid end delete pod %v %v on node %v", pod.Namespace, pod.Name, nodeName)
+	}
+	klog.Infof("porterdavid end delete all pods pod on node %v", nodeName)
+
+	return nil
 }
 
 func getInstanceByName(ctx *controllerContext, instanceName string) (*compute.Instance, error) {
